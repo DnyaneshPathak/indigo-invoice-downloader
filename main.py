@@ -223,16 +223,30 @@ def init_files():
         csv.writer(f).writerow(["PNR", "ERROR", "TIME"])
 
 
+
 def load_done_pnrs():
+    """Only successful output entries count as completed PNRs."""
     done = set()
-    for path in (OUTPUT_FILE, ERROR_FILE):
-        if os.path.exists(path):
-            with open(path, newline="", encoding="utf-8", errors="replace") as f:
-                rows = list(csv.reader(f))[1:]
-                for r in rows:
-                    if r:
-                        done.add(r[0].strip())
+
+    if os.path.exists(OUTPUT_FILE):
+        with open(
+            OUTPUT_FILE,
+            newline="",
+            encoding="utf-8",
+            errors="replace"
+        ) as f:
+            rows = list(csv.reader(f))[1:]
+
+            for row in rows:
+                if len(row) >= 2:
+                    pnr = row[0].strip()
+                    invoices = row[1].strip()
+
+                    if pnr and invoices:
+                        done.add(pnr)
+
     return done
+
 
 
 def write_output(csv_lock, pnr, invs):
@@ -515,6 +529,7 @@ def _fill_and_submit_pnr_form(driver, pnr, email, wlog, wid):
         driver.execute_script("arguments[0].click();", retrieve_btn)
 
 
+
 def fetch_invoices(driver, pnr, email, wid="?"):
     wlog = logging.getLogger(f"indigo.w{wid}")
 
@@ -554,7 +569,10 @@ def fetch_invoices(driver, pnr, email, wid="?"):
             current_url = driver.current_url
             if "summary" in current_url:
                 navigated = True
-                wlog.info(f"[WORKER {wid}] {pnr}: navigated to summary page: {current_url}")
+                wlog.info(
+                    f"[WORKER {wid}] {pnr}: navigated to summary page: "
+                    f"{current_url}"
+                )
                 break
         except Exception:
             pass
@@ -566,29 +584,144 @@ def fetch_invoices(driver, pnr, email, wid="?"):
 
         time.sleep(1.0)
 
+    
     if not navigated:
-        # Check for error text
         site_err = check_for_site_error(driver, wid)
+
+        try:
+            diagnostics = driver.execute_script("""
+                return {
+                    url: location.href,
+                    title: document.title,
+                    bodyText: (document.body?.innerText || '').slice(0, 1500)
+                };
+            """)
+        except Exception as diagnostic_error:
+            diagnostics = {
+                "diagnostic_error": str(diagnostic_error)
+            }
+
+        wlog.warning(
+            f"[WORKER {wid}] {pnr}: summary page not reached. "
+            f"Site error: {site_err!r}; "
+            f"Page diagnostics: {diagnostics}"
+        )
+
         if site_err:
             raise Exception(site_err)
-        raise Exception(f"Summary page not reached after submit and refresh mechanism for {pnr}")
+
+        raise Exception(
+            f"Summary page not reached for {pnr}; "
+            f"current URL: {driver.current_url}"
+        )
+
 
     # Wait for invoice content to render on Angular page
     wlog.info(f"[WORKER {wid}] {pnr}: waiting for invoice details to render...")
     try:
         WebDriverWait(driver, WAIT).until(
-            lambda d: "invoice number" in d.find_element(By.TAG_NAME, "body").text.lower()
+            lambda d: "invoice number"
+            in d.find_element(By.TAG_NAME, "body").text.lower()
         )
     except Exception:
         pass
 
-    # Extract invoice numbers from text
+    # Count the invoices initially displayed.
     body_text = driver.find_element(By.TAG_NAME, "body").text
-    invoices = re.findall(r"Invoice Number:\s*([A-Za-z0-9]+)", body_text)
+    initial_invoices = list(dict.fromkeys(
+        re.findall(r"Invoice Number:\s*([A-Za-z0-9]+)", body_text)
+    ))
+    initial_count = len(initial_invoices)
 
-    # Fallback to DOM elements if regex found none
+    wlog.info(
+        f"[WORKER {wid}] {pnr}: initially found {initial_count} invoice(s)"
+    )
+
+    # Expand "Get Your GST" to reveal any remaining invoices.
+    try:
+        expanded = driver.execute_script("""
+            const normalize = el =>
+                (el.innerText || el.textContent || '')
+                    .replace(/\\s+/g, ' ')
+                    .trim()
+                    .toUpperCase();
+
+            const controls = Array.from(document.querySelectorAll(
+                'button, a, [role="button"], summary, [tabindex]'
+            ));
+
+            let target = controls.find(el =>
+                el.getClientRects().length &&
+                normalize(el).includes('GET YOUR GST')
+            );
+
+            // Fallback if the dropdown label isn't itself a button.
+            if (!target) {
+                const labels = Array.from(document.querySelectorAll(
+                    'div, span, p, label'
+                ));
+
+                const label = labels.find(el =>
+                    el.getClientRects().length &&
+                    normalize(el) === 'GET YOUR GST'
+                );
+
+                if (label) {
+                    target = label.closest(
+                        'button, a, [role="button"], summary, [tabindex]'
+                    ) || label;
+                }
+            }
+
+            if (!target) return false;
+
+            target.scrollIntoView({block: 'center'});
+            target.click();
+            return true;
+        """)
+
+        if expanded:
+            wlog.info(
+                f"[WORKER {wid}] {pnr}: clicked 'Get Your GST'; "
+                "waiting for invoice list to expand..."
+            )
+
+            # Allow the site time to render additional invoice entries.
+            time.sleep(1.0)
+
+            try:
+                WebDriverWait(driver, 8).until(
+                    lambda d: len(set(re.findall(
+                        r"Invoice Number:\\s*([A-Za-z0-9]+)",
+                        d.find_element(By.TAG_NAME, "body").text
+                    ))) > initial_count
+                )
+            except Exception:
+                # The list may already be complete, or the site may render
+                # the expanded entries without changing the visible count.
+                pass
+        else:
+            wlog.warning(
+                f"[WORKER {wid}] {pnr}: could not locate 'Get Your GST'. "
+                "Reading the currently displayed invoice list."
+            )
+
+    except Exception as e:
+        wlog.warning(
+            f"[WORKER {wid}] {pnr}: invoice-list expansion failed: {e}"
+        )
+
+    # Extract invoice numbers AFTER attempting to expand the list.
+    body_text = driver.find_element(By.TAG_NAME, "body").text
+    invoices = list(dict.fromkeys(
+        re.findall(r"Invoice Number:\s*([A-Za-z0-9]+)", body_text)
+    ))
+
+    # Preserve the original DOM fallback if the text regex finds nothing.
     if not invoices:
-        elements = driver.find_elements(By.XPATH, '//*[contains(text(),"Invoice Number:")]')
+        elements = driver.find_elements(
+            By.XPATH, '//*[contains(text(),"Invoice Number:")]'
+        )
         for el in elements:
             txt = el.text.strip()
             if "Invoice Number:" in txt:
@@ -596,11 +729,14 @@ def fetch_invoices(driver, pnr, email, wid="?"):
                 if inv_num and inv_num not in invoices:
                     invoices.append(inv_num)
 
-    wlog.info(f"[WORKER {wid}] {pnr}: found {len(invoices)} invoice(s): {invoices}")
+    wlog.info(
+        f"[WORKER {wid}] {pnr}: found {len(invoices)} invoice(s): {invoices}"
+    )
     return invoices
 
 
 # ================= PDF =================
+
 
 def download_pdf(driver, inv, wid="?"):
     path = os.path.join(INVOICE_DIR, f"{inv}.pdf")
@@ -611,25 +747,110 @@ def download_pdf(driver, inv, wid="?"):
     wlog = logging.getLogger(f"indigo.w{wid}")
     wlog.info(f"[WORKER {wid}] downloading invoice {inv}")
 
-    # Always load images for the invoice page (needed for IndiGo logo in PDF).
+    # Always load images on the invoice page.
     set_image_blocking(driver, False)
-    driver.get(f"https://www.goindigo.in/view-gst-invoice/print.html?invoiceNumber={inv}")
+
+    url = (
+        "https://www.goindigo.in/view-gst-invoice/"
+        f"print.html?invoiceNumber={inv}"
+    )
+    driver.get(url)
     wait_ready(driver)
+
+    # Wait for the actual invoice content, not just document navigation.
+    try:
+        WebDriverWait(driver, WAIT).until(
+            lambda d: d.execute_script("""
+                const body = document.body;
+                if (!body) return false;
+
+                const text = (body.innerText || '').toLowerCase();
+                const hasInvoiceContent =
+                    text.includes('invoice') &&
+                    text.length > 150;
+
+                const hasVisibleImage = Array.from(
+                    document.images
+                ).some(img =>
+                    img.complete && img.naturalWidth > 0
+                );
+
+                const hasDocumentContent =
+                    document.querySelector(
+                        'iframe, canvas, object, embed'
+                    ) !== null;
+
+                return hasInvoiceContent ||
+                       hasVisibleImage ||
+                       hasDocumentContent;
+            """)
+        )
+    except Exception:
+        wlog.warning(
+            f"[WORKER {wid}] {inv}: invoice content readiness "
+            "condition was not confirmed; inspecting page anyway."
+        )
+
     wait_images_loaded(driver)
 
-    # Check for errors on the print page too
+    # Give the browser a brief opportunity to finish layout and rendering.
+    time.sleep(2)
+
+    # Diagnose the page if printing produces a suspiciously small PDF.
     site_err = check_for_site_error(driver, wid)
     if site_err:
         raise Exception(f"Error on invoice print page: {site_err}")
 
-    pdf = driver.execute_cdp_cmd("Page.printToPDF", {"printBackground": True})
-    data = base64.b64decode(pdf["data"])
+    try:
+        pdf = driver.execute_cdp_cmd(
+            "Page.printToPDF",
+            {
+                "printBackground": True,
+                "preferCSSPageSize": True
+            }
+        )
+        data = base64.b64decode(pdf["data"])
+    except Exception as e:
+        raise Exception(f"Could not print invoice {inv} to PDF: {e}")
 
     if len(data) < PDF_MIN_SIZE:
-        raise Exception("Blank PDF — invoice page may not have loaded correctly")
+        # Log useful diagnostic details without changing the workflow.
+        try:
+            diagnostics = driver.execute_script("""
+                return {
+                    url: location.href,
+                    title: document.title,
+                    bodyText: (document.body?.innerText || '').slice(0, 1000),
+                    bodyLength: (document.body?.innerText || '').length,
+                    images: Array.from(document.images).map(img => ({
+                        src: img.currentSrc || img.src,
+                        complete: img.complete,
+                        width: img.naturalWidth,
+                        height: img.naturalHeight
+                    }))
+                };
+            """)
+            wlog.warning(
+                f"[WORKER {wid}] {inv}: small PDF ({len(data)} bytes). "
+                f"Page diagnostics: {diagnostics}"
+            )
+        except Exception:
+            wlog.warning(
+                f"[WORKER {wid}] {inv}: PDF size only {len(data)} bytes."
+            )
+
+        raise Exception(
+            f"PDF too small ({len(data)} bytes) for invoice {inv}; "
+            "invoice rendering may not have completed."
+        )
 
     with open(path, "wb") as f:
         f.write(data)
+
+    wlog.info(
+        f"[WORKER {wid}] {inv}: saved PDF successfully "
+        f"({len(data)} bytes)"
+    )
 
 
 # ================= TASK (watched for hangs) =================
@@ -703,6 +924,7 @@ def worker(wid, task_queue, csv_lock):
         attempt = 0
         succeeded = False
         last_error = None
+        temporary_refresh_attempted = False
 
         while attempt <= MAX_RETRIES and not succeeded:
             attempt += 1
@@ -719,22 +941,84 @@ def worker(wid, task_queue, csv_lock):
                 wlog.info(f"[WORKER {wid}] Pausing {delay:.1f}s before next PNR...")
                 time.sleep(delay)
 
+            
             except Exception as e:
                 last_error = str(e)
-                wlog.warning(f"[WORKER {wid}] {pnr} failed (attempt {attempt}): {last_error}")
+                wlog.warning(
+                    f"[WORKER {wid}] {pnr} failed "
+                    f"(attempt {attempt}): {last_error}"
+                )
 
-                # If the error is definitely invalid details from the site, don't waste time retrying
-                if any(k in last_error.lower() for k in ["incorrect", "invalid", "not found"]):
-                    wlog.info(f"[WORKER {wid}] Booking details invalid for {pnr}, skipping retries.")
+                # Inspect the actual page because check_for_site_error()
+                # may return a generic message containing only "sorry".
+                page_text = ""
+                try:
+                    page_text = driver.find_element(
+                        By.TAG_NAME, "body"
+                    ).text.lower()
+                except Exception:
+                    pass
+
+                temporary_error = (
+                    "unable to fetch your gst invoice right now"
+                    in last_error.lower()
+                    or
+                    "unable to fetch your gst invoice right now"
+                    in page_text
+                )
+
+                # First occurrence: refresh the current page and retry
+                # this PNR using the existing processing flow.
+                if temporary_error and not temporary_refresh_attempted:
+                    temporary_refresh_attempted = True
+                    wlog.warning(
+                        f"[WORKER {wid}] Temporary IndiGo error for "
+                        f"{pnr}. Refreshing page before retry..."
+                    )
+                    try:
+                        driver.refresh()
+                        wait_ready(driver)
+                        time.sleep(2)
+                    except Exception as refresh_error:
+                        wlog.warning(
+                            f"[WORKER {wid}] Refresh failed: "
+                            f"{refresh_error}"
+                        )
+                    continue
+
+                # Do not retry indefinitely for invalid booking details.
+                if any(
+                    k in last_error.lower()
+                    for k in ["incorrect", "invalid", "not found"]
+                ):
+                    wlog.info(
+                        f"[WORKER {wid}] Booking details invalid for "
+                        f"{pnr}, skipping retries."
+                    )
                     break
 
-                # After any failure, wait longer before retrying — give the site time
-                # to "forget" about us and reset any rate-limit counters.
-                cooldown = random.uniform(DELAY_AFTER_ERROR_MIN, DELAY_AFTER_ERROR_MAX)
-                wlog.info(f"[WORKER {wid}] Cooling down {cooldown:.1f}s after error...")
+                # If the temporary error persists, allow a longer
+                # cooldown before recreating Chrome.
+                if temporary_error:
+                    cooldown = random.uniform(120, 180)
+                    wlog.warning(
+                        f"[WORKER {wid}] Temporary error persists for "
+                        f"{pnr}. Waiting {cooldown:.0f}s before recovery."
+                    )
+                else:
+                    cooldown = random.uniform(
+                        DELAY_AFTER_ERROR_MIN,
+                        DELAY_AFTER_ERROR_MAX
+                    )
+                    wlog.info(
+                        f"[WORKER {wid}] Cooling down "
+                        f"{cooldown:.1f}s after error..."
+                    )
+
                 time.sleep(cooldown)
 
-                # Recycle the driver to get a fresh session/cookies
+                # Recreate Chrome only after the refresh-first attempt
+                # has failed or another recoverable error occurred.
                 quit_driver(driver)
                 driver = create_driver(wid)
                 processed_since_restart = 0
