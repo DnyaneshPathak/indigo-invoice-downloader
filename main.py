@@ -26,18 +26,28 @@ WAIT = 30
 WAIT_SHORT = 15
 PDF_MIN_SIZE = 5000
 
-MAX_RETRIES = 2           # retries per PNR before giving up (increased to handle transient errors)
-TASK_TIMEOUT = 120        # hard ceiling (seconds) for one PNR before we force-kill the driver
-RESTART_AFTER = 20        # recycle the browser after this many PNRs to stop memory/slowdown creep
-RESUME = True             # if True, skip PNRs already present in output.csv / pnr_errors.csv
+MAX_RETRIES = 2           # retries per PNR before giving up
+TASK_TIMEOUT = 120        # hard ceiling (seconds) for one PNR before force-killing the driver
+RESTART_AFTER = 20        # recycle the browser after this many PNRs (memory/slowdown guard)
+RESUME = True             # if True, skip PNRs already in output.csv / pnr_errors.csv
+
+# ---- Batching ----
+# Process PNRs in batches; pause between batches to let Akamai rate-limit window reset.
+BATCH_SIZE = 90           # PNRs per batch
+BATCH_REST_SECS = 600     # 10-minute rest between batches
+
+# ---- Circuit Breaker ----
+# If the worker sees this many consecutive errors (across PNRs), it assumes the IP is
+# temporarily banned and sleeps for CIRCUIT_BREAKER_SLEEP seconds before resuming.
+CIRCUIT_BREAKER_LIMIT = 5
+CIRCUIT_BREAKER_SLEEP = 1800  # 30 minutes
 
 # ---- Human-like delays between requests ----
-# The "sorry, unable to retrieve" error is almost always Akamai/rate-limiting.
-# Adding realistic inter-request delays is the most effective fix.
-DELAY_BETWEEN_PNRS_MIN = 4    # minimum seconds to wait between PNRs (same worker)
-DELAY_BETWEEN_PNRS_MAX = 9    # maximum seconds to wait between PNRs (same worker)
-DELAY_AFTER_ERROR_MIN = 15    # wait longer after any error — the site needs cooldown
-DELAY_AFTER_ERROR_MAX = 30
+# Realistic inter-request delays are the most effective Akamai/rate-limit mitigation.
+DELAY_BETWEEN_PNRS_MIN = 5    # minimum seconds to wait between PNRs
+DELAY_BETWEEN_PNRS_MAX = 12   # maximum seconds to wait between PNRs
+DELAY_AFTER_ERROR_MIN = 20    # longer cooldown after any error
+DELAY_AFTER_ERROR_MAX = 40
 TYPING_DELAY_MIN = 0.05       # seconds between each keystroke (human-like typing)
 TYPING_DELAY_MAX = 0.18
 
@@ -898,6 +908,12 @@ def worker(wid, task_queue, csv_lock):
     Runs in its own OS process with its own independent Chrome browser.
     Pulls (pnr, email) tuples from the shared multiprocessing queue until
     it sees the sentinel None.
+
+    Batching & safety mechanisms:
+      - BATCH_SIZE PNRs per batch → BATCH_REST_SECS pause between batches.
+      - Circuit breaker: CIRCUIT_BREAKER_LIMIT consecutive failures triggers
+        a CIRCUIT_BREAKER_SLEEP second sleep before resuming.
+      - Browser recycled every RESTART_AFTER PNRs to prevent memory creep.
     """
     logging.basicConfig(
         level=logging.INFO,
@@ -909,7 +925,10 @@ def worker(wid, task_queue, csv_lock):
 
     driver = create_driver(wid)
     wlog.info(f"[WORKER {wid}] browser ready.")
-    processed_since_restart = 0
+
+    processed_since_restart = 0  # browser recycle counter
+    pnrs_in_batch = 0            # batch counter
+    consecutive_errors = 0       # circuit breaker counter
 
     while True:
         try:
@@ -929,19 +948,24 @@ def worker(wid, task_queue, csv_lock):
         while attempt <= MAX_RETRIES and not succeeded:
             attempt += 1
             try:
-                wlog.info(f"[WORKER {wid}] Processing {pnr} (attempt {attempt}/{MAX_RETRIES + 1})")
+                wlog.info(
+                    f"[WORKER {wid}] Processing {pnr} "
+                    f"(attempt {attempt}/{MAX_RETRIES + 1}, "
+                    f"batch {pnrs_in_batch + 1}/{BATCH_SIZE}, "
+                    f"circuit {consecutive_errors}/{CIRCUIT_BREAKER_LIMIT})"
+                )
                 invoices = run_with_timeout(driver, pnr, email, TASK_TIMEOUT, wid)
                 write_output(csv_lock, pnr, invoices)
                 succeeded = True
                 processed_since_restart += 1
+                pnrs_in_batch += 1
+                consecutive_errors = 0  # reset circuit breaker on success
 
-                # Human-like pause between successful PNRs.
-                # This is the most important rate-limit mitigation.
+                # Human-like pause between PNRs — primary Akamai rate-limit mitigation.
                 delay = random.uniform(DELAY_BETWEEN_PNRS_MIN, DELAY_BETWEEN_PNRS_MAX)
-                wlog.info(f"[WORKER {wid}] Pausing {delay:.1f}s before next PNR...")
+                wlog.info(f"[WORKER {wid}] ✓ {pnr} done. Pausing {delay:.1f}s...")
                 time.sleep(delay)
 
-            
             except Exception as e:
                 last_error = str(e)
                 wlog.warning(
@@ -949,8 +973,7 @@ def worker(wid, task_queue, csv_lock):
                     f"(attempt {attempt}): {last_error}"
                 )
 
-                # Inspect the actual page because check_for_site_error()
-                # may return a generic message containing only "sorry".
+                # Read page text once for all downstream checks.
                 page_text = ""
                 try:
                     page_text = driver.find_element(
@@ -960,15 +983,11 @@ def worker(wid, task_queue, csv_lock):
                     pass
 
                 temporary_error = (
-                    "unable to fetch your gst invoice right now"
-                    in last_error.lower()
-                    or
-                    "unable to fetch your gst invoice right now"
-                    in page_text
+                    "unable to fetch your gst invoice right now" in last_error.lower()
+                    or "unable to fetch your gst invoice right now" in page_text
                 )
 
-                # First occurrence: refresh the current page and retry
-                # this PNR using the existing processing flow.
+                # First occurrence: soft refresh & retry without rebuilding driver.
                 if temporary_error and not temporary_refresh_attempted:
                     temporary_refresh_attempted = True
                     wlog.warning(
@@ -981,12 +1000,11 @@ def worker(wid, task_queue, csv_lock):
                         time.sleep(2)
                     except Exception as refresh_error:
                         wlog.warning(
-                            f"[WORKER {wid}] Refresh failed: "
-                            f"{refresh_error}"
+                            f"[WORKER {wid}] Refresh failed: {refresh_error}"
                         )
                     continue
 
-                # Do not retry indefinitely for invalid booking details.
+                # Invalid PNR / booking details — no point retrying.
                 if any(
                     k in last_error.lower()
                     for k in ["incorrect", "invalid", "not found"]
@@ -997,8 +1015,7 @@ def worker(wid, task_queue, csv_lock):
                     )
                     break
 
-                # If the temporary error persists, allow a longer
-                # cooldown before recreating Chrome.
+                # Choose cooldown duration.
                 if temporary_error:
                     cooldown = random.uniform(120, 180)
                     wlog.warning(
@@ -1007,27 +1024,57 @@ def worker(wid, task_queue, csv_lock):
                     )
                 else:
                     cooldown = random.uniform(
-                        DELAY_AFTER_ERROR_MIN,
-                        DELAY_AFTER_ERROR_MAX
+                        DELAY_AFTER_ERROR_MIN, DELAY_AFTER_ERROR_MAX
                     )
                     wlog.info(
-                        f"[WORKER {wid}] Cooling down "
-                        f"{cooldown:.1f}s after error..."
+                        f"[WORKER {wid}] Cooling down {cooldown:.1f}s after error..."
                     )
 
                 time.sleep(cooldown)
 
-                # Recreate Chrome only after the refresh-first attempt
-                # has failed or another recoverable error occurred.
+                # Recreate Chrome after a failed attempt.
                 quit_driver(driver)
                 driver = create_driver(wid)
                 processed_since_restart = 0
 
+        # ---- Post-PNR bookkeeping ----
         if not succeeded:
             write_error(csv_lock, pnr, last_error or "Unknown error")
+            consecutive_errors += 1
+        # (consecutive_errors already reset to 0 inside the success path)
 
+        # ---- Circuit Breaker ----
+        if consecutive_errors >= CIRCUIT_BREAKER_LIMIT:
+            wlog.warning(
+                f"[WORKER {wid}] Circuit breaker triggered: "
+                f"{consecutive_errors} consecutive failures. "
+                f"Sleeping {CIRCUIT_BREAKER_SLEEP // 60} min to let Akamai cool down..."
+            )
+            time.sleep(CIRCUIT_BREAKER_SLEEP)
+            # Rebuild the browser after the long sleep.
+            quit_driver(driver)
+            driver = create_driver(wid)
+            processed_since_restart = 0
+            pnrs_in_batch = 0
+            consecutive_errors = 0
+            wlog.info(f"[WORKER {wid}] Circuit breaker reset. Resuming.")
+
+        # ---- Batch Rest ----
+        elif pnrs_in_batch >= BATCH_SIZE:
+            wlog.info(
+                f"[WORKER {wid}] Batch of {BATCH_SIZE} PNRs complete. "
+                f"Resting {BATCH_REST_SECS // 60} min before next batch..."
+            )
+            time.sleep(BATCH_REST_SECS)
+            pnrs_in_batch = 0
+            wlog.info(f"[WORKER {wid}] Batch rest done. Resuming.")
+
+        # ---- Periodic Browser Recycle ----
         if processed_since_restart >= RESTART_AFTER:
-            wlog.info(f"[WORKER {wid}] Recycling browser after {RESTART_AFTER} PNRs")
+            wlog.info(
+                f"[WORKER {wid}] Recycling browser after {RESTART_AFTER} PNRs "
+                "to prevent memory/slowdown creep."
+            )
             quit_driver(driver)
             driver = create_driver(wid)
             processed_since_restart = 0
@@ -1040,6 +1087,13 @@ def worker(wid, task_queue, csv_lock):
 
 def main():
     log.info("========== INDIGO INVOICE DOWNLOADER START (multi-browser) ==========")
+    log.info(
+        f"Config → workers={WORKERS}, batch={BATCH_SIZE} PNRs, "
+        f"batch_rest={BATCH_REST_SECS//60} min, "
+        f"circuit_breaker={CIRCUIT_BREAKER_LIMIT} errors / {CIRCUIT_BREAKER_SLEEP//60} min sleep, "
+        f"delay=[{DELAY_BETWEEN_PNRS_MIN}-{DELAY_BETWEEN_PNRS_MAX}]s, "
+        f"restart_after={RESTART_AFTER}"
+    )
 
     if RESUME and os.path.exists(OUTPUT_FILE) and os.path.exists(ERROR_FILE):
         done = load_done_pnrs()
@@ -1054,21 +1108,19 @@ def main():
     all_pnrs = parse_pnr_list(raw_rows)
     log.info(f"Loaded {len(all_pnrs)} record(s) from input file.")
 
-    pending = []
-    for pnr, email in all_pnrs:
-        if pnr in done:
-            continue
-        pending.append((pnr, email))
-
-    log.info(f"Queued {len(pending)} PNR(s) for processing across {WORKERS} independent browser(s).")
+    pending = [(pnr, email) for pnr, email in all_pnrs if pnr not in done]
+    log.info(
+        f"Queued {len(pending)} PNR(s) for processing across {WORKERS} independent browser(s). "
+        f"Estimated batches: {-(-len(pending) // BATCH_SIZE)} × {BATCH_SIZE} PNRs."
+    )
 
     if not pending:
         log.info("Nothing to do.")
         return
 
-    # PRE-WARM: patch the undetected_chromedriver executable once here,
-    # in the main process, before any worker processes exist. This avoids the
-    # one-time driver-patch race condition when workers launch in parallel.
+    # PRE-WARM: patch the undetected_chromedriver executable once here in the
+    # main process before any worker processes exist, avoiding the one-time
+    # driver-patch race condition when workers launch in parallel.
     log.info("Pre-warming Chrome driver (one-time patch check)...")
     try:
         warm = create_driver("prewarm")
